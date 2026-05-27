@@ -41,7 +41,7 @@ twilio_client = Client(ACCOUNT_SID, AUTH_TOKEN, region="us1")
 
 # Keep track of calls we've already initiated this session so we don't
 # double-fire if the scan catches the same event twice.
-_fired: set[str] = set()
+_fired: dict = {}  # event_id → start dateTime string
 
 
 # ---------------------------------------------------------------------------
@@ -167,8 +167,11 @@ def scan(service) -> None:
         event_id = event["id"]
         summary  = event.get("summary", "")
 
-        if event_id in _fired:
-            continue  # already initiated this call
+        start = event.get("start", {})
+        start_time = start.get("dateTime", start.get("date", ""))
+
+        if event_id in _fired and _fired[event_id] == start_time:
+            continue  # same start time, already called
 
         target_number, contact_name = parse_title(summary)
 
@@ -179,7 +182,7 @@ def scan(service) -> None:
         label = f"→ {contact_name}" if contact_name else ""
         print(f"[{now_str}] Matched: '{summary}' {label} ({target_number})")
         initiate_bridge(MY_NUMBER, target_number)
-        _fired.add(event_id)
+        _fired[event_id] = start_time
 
 
 def main() -> None:
