@@ -133,57 +133,23 @@ def get_events_starting_now(service) -> list[dict]:
 # twilio bridge
 # -------------------------
 def initiate_bridge(my_num: str, target_num: str) -> None:
-    hold_twiml = """<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Pause length="60"/>
-</Response>"""
-
-    print(f"[{datetime.now()}] Calling {my_num}, waiting for answer...")
-
-    call = twilio_client.calls.create(
-        twiml=hold_twiml,
-        to=my_num,
-        from_=TWILIO_NUMBER,
-        record=False,
-    )
-
-    # Wait for host to answer
-    answered = False
-    for _ in range(30):
-        time.sleep(1)
-        status = twilio_client.calls(call.sid).fetch().status
-        if status == "in-progress":
-            answered = True
-            break
-        if status in ("completed", "busy", "failed", "no-answer", "canceled"):
-            print(f"  [bridge] Host didn't answer ({status}), ending.")
-            return  # ← exits immediately, target never dialed
-
-    if not answered:
-        # 30 seconds elapsed, host never answered — hang up and bail
-        twilio_client.calls(call.sid).update(status="completed")
-        print(f"  [bridge] Host timeout, ending.")
-        return
-
-    # Host answered — now bridge to target
-    bridge_twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    laml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Dial callerId="{my_num}" timeout="30" answerOnBridge="true">
         <Number codec="PCMU">{target_num}</Number>
     </Dial>
 </Response>"""
 
-    twilio_client.calls(call.sid).update(twiml=bridge_twiml)
-    print(f"  [bridge] Answered — bridging to {target_num}")
-    print(f"  [bridge] Call SID: {call.sid}")
+    print(f"[{datetime.now()}] Calling {my_num} and bridging to {target_num}...")
 
-    # Monitor — if host hangs up, kill the whole call
-    while True:
-        time.sleep(2)
-        status = twilio_client.calls(call.sid).fetch().status
-        if status in ("completed", "failed", "canceled"):
-            print(f"  [bridge] Call ended ({status}).")
-            return
+    call = twilio_client.calls.create(
+        twiml=laml,
+        to=my_num,
+        from_=TWILIO_NUMBER,
+        timeout=30,
+    )
+
+    print(f"Call SID: {call.sid}")
 
 # ---------------------------------------------------------------------------
 # MAIN SCAN LOOP
