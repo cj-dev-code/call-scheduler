@@ -133,24 +133,42 @@ def get_events_starting_now(service) -> list[dict]:
 # twilio bridge
 # -------------------------
 def initiate_bridge(my_num: str, target_num: str) -> None:
-    laml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    # Step 1: Call YOU with hold music / silence
+    hold_twiml = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Pause length="1"/>
-    <Dial callerId="{my_num}" timeout="30" answerOnBridge="true">
-        <Number codec="PCMU">{target_num}</Number>
-    </Dial>
+    <Pause length="60"/>
 </Response>"""
 
-    print(f"[{datetime.now()}] Calling {my_num} and bridging to {target_num}...")
+    print(f"[{datetime.now()}] Calling {my_num}, waiting for answer...")
 
     call = twilio_client.calls.create(
-        twiml=laml,
+        twiml=hold_twiml,
         to=my_num,
         from_=TWILIO_NUMBER,
         record=False,
     )
 
-    print(f"Call SID: {call.sid}")
+    # Step 2: Poll until you answer (or timeout)
+    for _ in range(30):  # wait up to 30 seconds
+        time.sleep(1)
+        status = twilio_client.calls(call.sid).fetch().status
+        if status == "in-progress":
+            break
+        if status in ("completed", "busy", "failed", "no-answer"):
+            print(f"  [bridge] Call ended before answer: {status}")
+            return
+
+    # Step 3: Now dial the target by updating the call with new TwiML
+    bridge_twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Dial callerId="{my_num}" timeout="30" answerOnBridge="true">
+        <Number codec="PCMU">{target_num}</Number>
+    </Dial>
+</Response>"""
+
+    twilio_client.calls(call.sid).update(twiml=bridge_twiml)
+    print(f"  [bridge] Answered — bridging to {target_num}")
+    print(f"  [bridge] Call SID: {call.sid}")
 
 # ---------------------------------------------------------------------------
 # MAIN SCAN LOOP
