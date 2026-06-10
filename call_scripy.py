@@ -135,6 +135,7 @@ def get_events_starting_now(service) -> list[dict]:
 def initiate_bridge(my_num: str, target_num: str) -> None:
     laml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+    <Pause length="1"/>
     <Dial callerId="{my_num}" timeout="30" answerOnBridge="true">
         <Number codec="PCMU">{target_num}</Number>
     </Dial>
