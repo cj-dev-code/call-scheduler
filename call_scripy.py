@@ -133,23 +133,56 @@ def get_events_starting_now(service) -> list[dict]:
 # twilio bridge
 # -------------------------
 def initiate_bridge(my_num: str, target_num: str) -> None:
-    laml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    # Create a TwiML response that will ONLY be executed if you answer
+    # But we need to handle the "no answer" case properly
+    
+    # First, initiate a call to your number with a very specific TwiML
+    # that uses <Enqueue> to wait without "answering"
+    
+    initial_twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Dial callerId="{my_num}" timeout="30" answerOnBridge="true">
-        <Number codec="PCMU">{target_num}</Number>
-    </Dial>
+    <Enqueue waitUrl="/wait-music.xml" timeout="25"/>
 </Response>"""
-
-    print(f"[{datetime.now()}] Calling {my_num} and bridging to {target_num}...")
-
+    
     call = twilio_client.calls.create(
-        twiml=laml,
+        twiml=initial_twiml,
         to=my_num,
         from_=TWILIO_NUMBER,
-        timeout=30,
+        timeout=25,  # This is ring timeout, NOT call timeout
+        # status_callback=f"{WEBHOOK_URL}/call_status",
+        # status_callback_event=['ringing', 'answered', 'completed'],
+        # status_callback_method='POST'
     )
-
-    print(f"Call SID: {call.sid}")
+    
+    # Monitor for actual answer
+    for _ in range(30):
+        time.sleep(1)
+        status = twilio_client.calls(call.sid).fetch().status
+        
+        if status == "in-progress":
+            # This means Twilio has connected audio, which only happens on answer
+            print("Call answered! Bridging...")
+            
+            # Now bridge using <Redirect> to new TwiML
+            bridge_twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Dial callerId="{my_num}" timeout="30">
+        <Number>{target_num}</Number>
+    </Dial>
+</Response>"""
+            twilio_client.calls(call.sid).update(twiml=bridge_twiml)
+            return
+            
+        elif status in ("completed", "busy", "failed", "no-answer", "canceled"):
+            print(f"Call not answered: {status}")
+            return
+    
+    # Timeout - kill the call
+    try:
+        twilio_client.calls(call.sid).update(status="completed")
+    except:
+        pass
+    print("No answer - call terminated")
 
 # ---------------------------------------------------------------------------
 # MAIN SCAN LOOP
