@@ -1,6 +1,7 @@
 import os
 import re
 import sched
+from tabnanny import check
 import time
 import threading
 from datetime import datetime, timezone, timedelta
@@ -35,7 +36,7 @@ if GOOGLE_SERVICE_ACCOUNT_JSON:
     CREDENTIALS_FILE.write_text(GOOGLE_SERVICE_ACCOUNT_JSON)
 
 SCAN_INTERVAL  = int(os.environ.get("SCAN_INTERVAL", 60))   # seconds between calendar scans
-
+TIMEOUT = 15  # seconds to let the phone ring before giving up
 
 twilio_client = Client(ACCOUNT_SID, AUTH_TOKEN, region="us1")
 
@@ -133,106 +134,66 @@ def get_events_starting_now(service) -> list[dict]:
 # twilio bridge
 # -------------------------
 def initiate_bridge(my_num: str, target_num: str) -> None:
-    """
-    Calls my_num. If I pick up, bridges to target_num.
-    If I don't pick up within 30 seconds, ends call without bridging.
-    """
-    
-    print(f"[{datetime.now()}] Calling {my_num}...")
-    
-    # Step 1: Create the call with NO TwiML and NO webhook
-    # This makes Twilio just RING your phone, nothing else
-    call = twilio_client.calls.create(
-        to=my_num,
-        from_=TWILIO_NUMBER,
-        timeout=30,  # How long to ring (seconds)
-        # NO twiml parameter
-        # NO url parameter
-        # NO status_callback (we'll poll instead)
-    )
-    
-    print(f"  Call SID: {call.sid}")
-    print(f"  Ringing for up to 30 seconds...")
-    
-    # Step 2: Poll the status until call resolves OR you answer
-    max_wait = 35  # Slightly longer than timeout
-    call_answered = False
-    final_status = None
-    
-    for i in range(max_wait):
-        time.sleep(1)
-        
-        # Fetch current status
-        current_call = twilio_client.calls(call.sid).fetch()
-        status = current_call.status
-        
-        print(f"  [{i+1}s] Status: {status}")
-        
-        # Status meanings for OUTBOUND calls from Twilio:
-        # - "ringing": Your phone is ringing
-        # - "in-progress": YOU answered (or voicemail - but we're calling YOUR number)
-        # - "completed": Call ended after being answered or voicemail
-        # - "no-answer": Rang full timeout, nobody answered
-        # - "busy": Your line was busy
-        # - "failed" or "canceled": Something went wrong or you hung up before answer
-        
-        if status == "in-progress":
-            # YOU answered! (Since we're calling YOUR number, not an IVR)
-            call_answered = True
-            print(f"  ✓ You answered the call!")
-            break
-            
-        elif status in ("completed", "no-answer", "busy", "failed", "canceled"):
-            # Call ended without you answering
-            final_status = status
-            print(f"  ✗ Call ended with status: {status}")
-            break
-    
-    # Step 3: Handle the two cases
-    if call_answered:
-        # YOU picked up - now bridge to BCBSIL
-        print(f"\n  Bridging to {target_num}...")
-        
-        # Create the bridge TwiML
-        bridge_twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    # Call the host and bridge immediately using Twilio's answerOnBridge
+    twiml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+    <Pause length="3"/>
     <Dial callerId="{my_num}" answerOnBridge="true" timeout="30">
         <Number>{target_num}</Number>
     </Dial>
 </Response>"""
-        
-        # Update the call with the bridge instructions
-        twilio_client.calls(call.sid).update(twiml=bridge_twiml)
-        
-        print(f"  ✓ Bridge initiated - you're now connected to {target_num}")
-        print(f"  The call will continue until either side hangs up.\n")
-        
-        # Monitor the call until it ends naturally
-        while True:
-            time.sleep(2)
-            status = twilio_client.calls(call.sid).fetch().status
-            if status in ("completed", "failed", "canceled"):
-                print(f"  [bridge] Call ended ({status})")
-                break
-                
-    else:
-        # You didn't pick up - just end things cleanly
-        if final_status == "no-answer":
-            print(f"\n  ✗ You didn't answer within 30 seconds - ending call.")
-        elif final_status == "busy":
-            print(f"\n  ✗ Your line was busy - ending call.")
-        else:
-            print(f"\n  ✗ Call ended ({final_status}) - no bridge attempted.")
-        
-        # Ensure call is cleaned up (it should already be ended, but just in case)
-        try:
-            current = twilio_client.calls(call.sid).fetch()
-            if current.status not in ("completed", "no-answer", "busy", "failed", "canceled"):
-                twilio_client.calls(call.sid).update(status="completed")
-        except:
-            pass
     
-    print(f"[{datetime.now()}] Call flow complete.\n")
+    print(f"[{datetime.now()}] Calling {my_num} and bridging to {target_num}")
+    
+    # This creates a call from Twilio to your number, and if/when you answer,
+    # it will automatically dial the target number and bridge the call
+    call = twilio_client.calls.create(
+        twiml=twiml_response,
+        to=my_num,
+        from_=TWILIO_NUMBER,
+        timeout=TIMEOUT,
+        machine_detection="Enable",
+        machine_detection_timeout=TIMEOUT+3,
+    )
+    
+    total_scan_time = TIMEOUT - 3  # we want to end the call before the timeout fully
+    # expires in order to prevent twilio from calling the target number if we let
+    # twilio ring out. that means continually scanning, and 
+    # ending the call ourselves if we are near the end of the timeout.
+    sleep_interval = .3 # seconds between status checks
+
+    remaining_scan = int(total_scan_time/sleep_interval)
+    _ = remaining_scan
+    status = "queued"
+    while _ > 0:
+        time.sleep(sleep_interval)
+        call_info = twilio_client.calls(call.sid).fetch()
+        pstatus, status = status, call_info.status
+        answeredby = call_info.answered_by    
+        # print(_, status, answeredby)
+        if pstatus == "ringing" and status == "in-progress":
+            _ += int(3/sleep_interval+0.5) # if we just got answered, 
+                # check for machine start for at least 3 more seconds
+                # to ensure the twilio api can call off the call correctly.
+        if status == "in-progress" and answeredby == "machine_start":
+            twilio_client.calls(call.sid).update(status="completed")
+            break
+        if status == "completed":
+            break
+        _ -= 1
+        # okay. so, if the call is answeredby a machine,
+        #  we should probably cancel the call immediately to avoid weirdness. 
+    # if the answering machine terminates us early, then we are still caught in machine start.
+    # we have 3 whole seconds. im not sure how long the twilio api takes to notice a machine start,
+    # but we can change that by increasing the rate on the scan interval.
+    # i dont want to exceed 3 seconds of pause time for ux.
+    if status == "ringing": # we have rung out the timeout window. end on our terms.
+        # in order to avoid twilio calling the target number after we let it ring out.
+        twilio_client.calls(call.sid).update(status="completed")
+    # if status == "no-answer": # in this case, twilio correctly ends the call.
+    #     twilio_client.calls(call.sid).update(status="completed")
+    print(f"  [bridge] Call initiated: {call.sid}")
+    print(f"  [bridge] Will ring for 15 seconds. If unanswered, call will end.")
 
 # ---------------------------------------------------------------------------
 # MAIN SCAN LOOP
