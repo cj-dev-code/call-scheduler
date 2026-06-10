@@ -28,7 +28,7 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 
 CALENDAR_ID    = "cj.dev.code@gmail.com"                              # or a specific calendar ID
 CONTACTS_FILE  = Path("contacts.txt")
-SCOPES         = ["https://www.googleapis.com/auth/calendar.readonly"]
+SCOPES         = ["https://www.googleapis.com/auth/calendar"]
 TOKEN_FILE     = Path("token.json")
 CREDENTIALS_FILE = Path("credentials.json")            # Downloaded from Google Cloud Console
 
@@ -86,15 +86,15 @@ def parse_title(title: str) -> Tuple[Optional[str], Optional[str]]:
         else:
             name = part
 
-    if number is None and name is not None:
-        # "call Taylor" — look up in contacts
-        number = lookup_contact(name)
-        if number is None:
-            print(f"  [parse] Unknown contact '{name}' and no number provided.")
-            return None, None
+    # if number is None and name is not None:
+    #     # "call Taylor" — look up in contacts
+    #     number = lookup_contact(name)
+    #     if number is None:
+    #         print(f"  [parse] Unknown contact '{name}' and no number provided.")
+    #         return None, None
 
-    if number and name:
-        upsert_contact(name, number)
+    # if number and name:
+    #     upsert_contact(name, number)
 
     return number, name
 
@@ -103,6 +103,37 @@ def parse_title(title: str) -> Tuple[Optional[str], Optional[str]]:
 # GOOGLE CALENDAR
 # ---------------------------------------------------------------------------
 
+def create_and_share_calendar(phone_number: str, email: str) -> str:
+    """
+    Creates a calendar named <phone_number> and shares it with <email>.
+    Returns the new calendar's ID.
+    """
+    service = _get_calendar_service()
+
+    # Create the calendar
+    calendar = service.calendars().insert(body={
+        "summary": phone_number,
+        "timeZone": "America/New_York"
+    }).execute()
+
+    calendar_id = calendar["id"]
+    print(f"Created calendar '{phone_number}' with ID: {calendar_id}")
+
+    # Share it with the user's email
+    service.acl().insert(
+        calendarId=calendar_id,
+        body={
+            "role": "writer",
+            "scope": {
+                "type": "user",
+                "value": email
+            }
+        }
+    ).execute()
+
+    print(f"Shared with {email}")
+    return calendar_id
+
 def _get_calendar_service():
     creds = service_account.Credentials.from_service_account_file(
         "service_account.json",
@@ -110,7 +141,21 @@ def _get_calendar_service():
     )
     return build("calendar", "v3", credentials=creds)
 
-def get_events_starting_now(service) -> list[dict]:
+def get_app_calendars(service) -> List[dict]:
+    """
+    Return all calendars shared with the service account whose summary
+    (display name) looks like a phone number e.g. +16031234567.
+    """
+    result = service.calendarList().list().execute()
+    calendars = result.get("items", [])
+    app_cals = []
+    for cal in calendars:
+        summary = cal.get("summary", "")
+        if _is_e164(summary):
+            app_cals.append(cal)
+    return app_cals
+
+def get_events_starting_now(service, cals) -> list[dict]:
     """
     Return calendar events whose start time falls within the current minute.
     """
@@ -118,15 +163,21 @@ def get_events_starting_now(service) -> list[dict]:
     window_start = now.replace(second=0, microsecond=0)
     window_end   = window_start + timedelta(minutes=1)
 
-    result = service.events().list(
-        calendarId=CALENDAR_ID,
-        timeMin=window_start.isoformat(),
-        timeMax=window_end.isoformat(),
-        singleEvents=True,
-        orderBy="startTime",
-    ).execute()
-
-    return result.get("items", [])
+    remainder = []
+    for cal in cals:
+        result = service.events().list(
+            calendarId=cal['id'],
+            timeMin=window_start.isoformat(),
+            timeMax=window_end.isoformat(),
+            singleEvents=True,
+            orderBy="startTime",
+        ).execute()
+        result = result.get("items", [])
+        for e in result:
+            e['calendar_id'] = cal['id']  # attach calendar ID for later reference
+            e['host_number'] = _normalise_number(cal['summary'])
+        remainder.extend(result)
+    return remainder
 
 
 
@@ -201,14 +252,16 @@ def initiate_bridge(my_num: str, target_num: str) -> None:
 
 def scan(service) -> None:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    events = get_events_starting_now(service)
-
+    cals = get_app_calendars(service)
+    events = get_events_starting_now(service, cals)
+    
     if not events:
         print(f"[{now_str}] No calls scheduled this minute.")
         return
 
     for event in events:
-        event_id = event["id"]
+        event_id = event['calendar_id'] + ":" + event['id']
+        print(event_id, _fired)
         summary  = event.get("summary", "")
 
         start = event.get("start", {})
@@ -225,7 +278,7 @@ def scan(service) -> None:
 
         label = f"→ {contact_name}" if contact_name else ""
         print(f"[{now_str}] Matched: '{summary}' {label} ({target_number})")
-        initiate_bridge(MY_NUMBER, target_number)
+        initiate_bridge(event['host_number'], target_number)
         _fired[event_id] = start_time
 
 
@@ -242,4 +295,7 @@ def main() -> None:
         time.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
+    # create_and_share_calendar("+16034792113", "cj.dev.code@gmail.com")
+    # create_and_share_calendar("+13479548056", "rebeccar221b@gmail.com")
+    # 1/0
     main()
