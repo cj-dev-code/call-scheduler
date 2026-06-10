@@ -133,53 +133,106 @@ def get_events_starting_now(service) -> list[dict]:
 # twilio bridge
 # -------------------------
 def initiate_bridge(my_num: str, target_num: str) -> None:
-    # Create a TwiML response that will ONLY be executed if you answer
-    # But we need to handle the "no answer" case properly
+    """
+    Calls my_num. If I pick up, bridges to target_num.
+    If I don't pick up within 30 seconds, ends call without bridging.
+    """
     
-    # First, initiate a call to your number with a very specific TwiML
-    # that uses <Enqueue> to wait without "answering"
+    print(f"[{datetime.now()}] Calling {my_num}...")
     
-    initial_twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Enqueue waitUrl="/wait-music.xml" timeout="25"/>
-</Response>"""
-    
+    # Step 1: Create the call with NO TwiML and NO webhook
+    # This makes Twilio just RING your phone, nothing else
     call = twilio_client.calls.create(
-        twiml=initial_twiml,
         to=my_num,
         from_=TWILIO_NUMBER,
-        timeout=25,  # This is ring timeout, NOT call timeout
+        timeout=30,  # How long to ring (seconds)
+        # NO twiml parameter
+        # NO url parameter
+        # NO status_callback (we'll poll instead)
     )
     
-    # Monitor for actual answer
-    for _ in range(26):
+    print(f"  Call SID: {call.sid}")
+    print(f"  Ringing for up to 30 seconds...")
+    
+    # Step 2: Poll the status until call resolves OR you answer
+    max_wait = 35  # Slightly longer than timeout
+    call_answered = False
+    final_status = None
+    
+    for i in range(max_wait):
         time.sleep(1)
-        status = twilio_client.calls(call.sid).fetch().status
+        
+        # Fetch current status
+        current_call = twilio_client.calls(call.sid).fetch()
+        status = current_call.status
+        
+        print(f"  [{i+1}s] Status: {status}")
+        
+        # Status meanings for OUTBOUND calls from Twilio:
+        # - "ringing": Your phone is ringing
+        # - "in-progress": YOU answered (or voicemail - but we're calling YOUR number)
+        # - "completed": Call ended after being answered or voicemail
+        # - "no-answer": Rang full timeout, nobody answered
+        # - "busy": Your line was busy
+        # - "failed" or "canceled": Something went wrong or you hung up before answer
         
         if status == "in-progress":
-            # This means Twilio has connected audio, which only happens on answer
-            print("Call answered! Bridging...")
+            # YOU answered! (Since we're calling YOUR number, not an IVR)
+            call_answered = True
+            print(f"  ✓ You answered the call!")
+            break
             
-            # Now bridge using <Redirect> to new TwiML
-            bridge_twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+        elif status in ("completed", "no-answer", "busy", "failed", "canceled"):
+            # Call ended without you answering
+            final_status = status
+            print(f"  ✗ Call ended with status: {status}")
+            break
+    
+    # Step 3: Handle the two cases
+    if call_answered:
+        # YOU picked up - now bridge to BCBSIL
+        print(f"\n  Bridging to {target_num}...")
+        
+        # Create the bridge TwiML
+        bridge_twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Dial callerId="{my_num}" timeout="30">
+    <Dial callerId="{my_num}" answerOnBridge="true" timeout="30">
         <Number>{target_num}</Number>
     </Dial>
 </Response>"""
-            twilio_client.calls(call.sid).update(twiml=bridge_twiml)
-            
-            
-        elif status in ("completed", "busy", "failed", "no-answer", "canceled"):
-            print(f"Call not answered: {status}")
-            
-    if _ == 26:
-        # Timeout - kill the call
+        
+        # Update the call with the bridge instructions
+        twilio_client.calls(call.sid).update(twiml=bridge_twiml)
+        
+        print(f"  ✓ Bridge initiated - you're now connected to {target_num}")
+        print(f"  The call will continue until either side hangs up.\n")
+        
+        # Monitor the call until it ends naturally
+        while True:
+            time.sleep(2)
+            status = twilio_client.calls(call.sid).fetch().status
+            if status in ("completed", "failed", "canceled"):
+                print(f"  [bridge] Call ended ({status})")
+                break
+                
+    else:
+        # You didn't pick up - just end things cleanly
+        if final_status == "no-answer":
+            print(f"\n  ✗ You didn't answer within 30 seconds - ending call.")
+        elif final_status == "busy":
+            print(f"\n  ✗ Your line was busy - ending call.")
+        else:
+            print(f"\n  ✗ Call ended ({final_status}) - no bridge attempted.")
+        
+        # Ensure call is cleaned up (it should already be ended, but just in case)
         try:
-            twilio_client.calls(call.sid).update(status="completed")
+            current = twilio_client.calls(call.sid).fetch()
+            if current.status not in ("completed", "no-answer", "busy", "failed", "canceled"):
+                twilio_client.calls(call.sid).update(status="completed")
         except:
             pass
-        print("No answer - call terminated")
+    
+    print(f"[{datetime.now()}] Call flow complete.\n")
 
 # ---------------------------------------------------------------------------
 # MAIN SCAN LOOP
