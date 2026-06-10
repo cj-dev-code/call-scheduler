@@ -133,7 +133,6 @@ def get_events_starting_now(service) -> list[dict]:
 # twilio bridge
 # -------------------------
 def initiate_bridge(my_num: str, target_num: str) -> None:
-    # Step 1: Call YOU with hold music / silence
     hold_twiml = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Pause length="60"/>
@@ -148,17 +147,25 @@ def initiate_bridge(my_num: str, target_num: str) -> None:
         record=False,
     )
 
-    # Step 2: Poll until you answer (or timeout)
-    for _ in range(30):  # wait up to 30 seconds
+    # Wait for host to answer
+    answered = False
+    for _ in range(30):
         time.sleep(1)
         status = twilio_client.calls(call.sid).fetch().status
         if status == "in-progress":
+            answered = True
             break
-        if status in ("completed", "busy", "failed", "no-answer"):
-            print(f"  [bridge] Call ended before answer: {status}")
-            return
+        if status in ("completed", "busy", "failed", "no-answer", "canceled"):
+            print(f"  [bridge] Host didn't answer ({status}), ending.")
+            return  # ← exits immediately, target never dialed
 
-    # Step 3: Now dial the target by updating the call with new TwiML
+    if not answered:
+        # 30 seconds elapsed, host never answered — hang up and bail
+        twilio_client.calls(call.sid).update(status="completed")
+        print(f"  [bridge] Host timeout, ending.")
+        return
+
+    # Host answered — now bridge to target
     bridge_twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Dial callerId="{my_num}" timeout="30" answerOnBridge="true">
@@ -169,6 +176,14 @@ def initiate_bridge(my_num: str, target_num: str) -> None:
     twilio_client.calls(call.sid).update(twiml=bridge_twiml)
     print(f"  [bridge] Answered — bridging to {target_num}")
     print(f"  [bridge] Call SID: {call.sid}")
+
+    # Monitor — if host hangs up, kill the whole call
+    while True:
+        time.sleep(2)
+        status = twilio_client.calls(call.sid).fetch().status
+        if status in ("completed", "failed", "canceled"):
+            print(f"  [bridge] Call ended ({status}).")
+            return
 
 # ---------------------------------------------------------------------------
 # MAIN SCAN LOOP
