@@ -149,13 +149,10 @@ def initiate_bridge(my_num: str, target_num: str) -> None:
         to=my_num,
         from_=TWILIO_NUMBER,
         timeout=25,  # This is ring timeout, NOT call timeout
-        # status_callback=f"{WEBHOOK_URL}/call_status",
-        # status_callback_event=['ringing', 'answered', 'completed'],
-        # status_callback_method='POST'
     )
     
     # Monitor for actual answer
-    for _ in range(30):
+    for _ in range(26):
         time.sleep(1)
         status = twilio_client.calls(call.sid).fetch().status
         
@@ -171,18 +168,18 @@ def initiate_bridge(my_num: str, target_num: str) -> None:
     </Dial>
 </Response>"""
             twilio_client.calls(call.sid).update(twiml=bridge_twiml)
-            return
+            
             
         elif status in ("completed", "busy", "failed", "no-answer", "canceled"):
             print(f"Call not answered: {status}")
-            return
-    
-    # Timeout - kill the call
-    try:
-        twilio_client.calls(call.sid).update(status="completed")
-    except:
-        pass
-    print("No answer - call terminated")
+            
+    if _ == 26:
+        # Timeout - kill the call
+        try:
+            twilio_client.calls(call.sid).update(status="completed")
+        except:
+            pass
+        print("No answer - call terminated")
 
 # ---------------------------------------------------------------------------
 # MAIN SCAN LOOP
