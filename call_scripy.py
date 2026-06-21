@@ -17,6 +17,9 @@ from google.oauth2 import service_account
 
 from twilio.rest import Client
 
+from flask import Flask, request as flask_request
+from pyngrok import ngrok, conf
+
 from dotenv import load_dotenv
 load_dotenv()  # must be called before any os.environ.get()
 
@@ -25,6 +28,8 @@ AUTH_TOKEN     = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_NUMBER  = os.environ.get("TWILIO_NUMBER", "")   # e.g. +16031234567
 MY_NUMBER      = os.environ.get("MY_NUMBER", "")       # Your personal number
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+NGROK_AUTH_TOKEN = os.environ.get("NGROK_AUTH_TOKEN", "")  # from ngrok.com dashboard
+FLASK_PORT     = int(os.environ.get("FLASK_PORT", 5001))
 
 CALENDAR_ID    = "cj.dev.code@gmail.com"                              # or a specific calendar ID
 CONTACTS_FILE  = Path("contacts.txt")
@@ -52,8 +57,19 @@ _fired: dict = {}  # event_id → start dateTime string
 E164_RE = re.compile(r"^\+?1?\d{10,11}$")
 
 
+def _clean_number(token: str) -> str:
+    """Strip common phone-number punctuation: spaces, dashes, parens, dots."""
+    return (
+        token.replace("-", "")
+             .replace(" ", "")
+             .replace("(", "")
+             .replace(")", "")
+             .replace(".", "")
+    )
+
+
 def _is_e164(token: str) -> bool:
-    return bool(E164_RE.match(token.replace("-", "").replace(" ", "")))
+    return bool(E164_RE.match(_clean_number(token)))
 
 
 def _normalise_number(raw: str) -> str:
@@ -106,9 +122,24 @@ def parse_title(title: str) -> Tuple[Optional[str], Optional[str]]:
 def create_and_share_calendar(phone_number: str, email: str) -> str:
     """
     Creates a calendar named <phone_number> and shares it with <email>.
-    Returns the new calendar's ID.
+    If a calendar with this exact phone_number + email pairing already
+    exists, skips creation and returns the existing calendar's ID.
+    Returns the calendar's ID.
     """
     service = _get_calendar_service()
+
+    # Check for an existing calendar with this phone number that is
+    # already shared with this email.
+    existing = service.calendarList().list().execute().get("items", [])
+    for cal in existing:
+        if cal.get("summary", "") != phone_number:
+            continue
+        acl_rules = service.acl().list(calendarId=cal["id"]).execute().get("items", [])
+        for rule in acl_rules:
+            scope = rule.get("scope", {})
+            if scope.get("type") == "user" and scope.get("value", "").lower() == email.lower():
+                print(f"Calendar for {phone_number} already shared with {email}, skipping.")
+                return cal["id"]
 
     # Create the calendar
     calendar = service.calendars().insert(body={
@@ -133,6 +164,77 @@ def create_and_share_calendar(phone_number: str, email: str) -> str:
 
     print(f"Shared with {email}")
     return calendar_id
+
+
+def list_owned_calendars() -> List[dict]:
+    """
+    Manual utility: prints and returns every calendar the service account
+    owns (i.e. created itself, as opposed to ones merely shared with it),
+    along with the emails each calendar is shared with.
+    Call this directly, e.g. `python -c "from call_scripy import list_owned_calendars; list_owned_calendars()"`
+    """
+    service = _get_calendar_service()
+    result = service.calendarList().list().execute()
+    calendars = result.get("items", [])
+
+    owned = [c for c in calendars if c.get("accessRole") == "owner"]
+
+    print(f"Service account owns {len(owned)} calendar(s):\n")
+    for cal in owned:
+        acl_rules = service.acl().list(calendarId=cal["id"]).execute().get("items", [])
+        shared_with = [
+            rule["scope"]["value"]
+            for rule in acl_rules
+            if rule.get("scope", {}).get("type") == "user"
+        ]
+        print(f"  {cal.get('summary', '(no name)'):20}  id: {cal['id']}")
+        if shared_with:
+            for email in shared_with:
+                print(f"      shared with: {email}")
+        else:
+            print(f"      shared with: (none)")
+
+    return owned
+
+
+def delete_calendar(calendar_id: str) -> None:
+    """
+    Manual utility: permanently deletes a calendar owned by the service
+    account. This is irreversible. Pass the calendar_id from
+    list_owned_calendars().
+    """
+    service = _get_calendar_service()
+    try:
+        service.calendars().delete(calendarId=calendar_id).execute()
+        print(f"Deleted calendar: {calendar_id}")
+    except Exception as e:
+        print(f"Failed to delete {calendar_id}: {e}")
+
+
+def delete_calendars_for_number(phone_number: str) -> int:
+    """
+    Deletes every calendar owned by the service account whose title
+    (summary) matches phone_number exactly. Returns the count deleted.
+    """
+    service = _get_calendar_service()
+    result = service.calendarList().list().execute()
+    calendars = result.get("items", [])
+
+    matches = [c for c in calendars if c.get("summary", "") == phone_number]
+
+    deleted = 0
+    for cal in matches:
+        try:
+            service.calendars().delete(calendarId=cal["id"]).execute()
+            print(f"Deleted calendar for {phone_number}: {cal['id']}")
+            deleted += 1
+        except Exception as e:
+            print(f"Failed to delete {cal['id']}: {e}")
+
+    if deleted == 0:
+        print(f"No calendars found for {phone_number}.")
+
+    return deleted
 
 def _get_calendar_service():
     creds = service_account.Credentials.from_service_account_file(
@@ -246,6 +348,87 @@ def initiate_bridge(my_num: str, target_num: str) -> None:
     print(f"  [bridge] Call initiated: {call.sid}")
     print(f"  [bridge] Will ring for 15 seconds. If unanswered, call will end.")
 
+
+# ---------------------------------------------------------------------------
+# SMS ONBOARDING (NEW)
+# ---------------------------------------------------------------------------
+
+EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+
+flask_app = Flask(__name__)
+
+
+@flask_app.route("/sms", methods=["POST"])
+def sms_handler():
+    """
+    Twilio hits this when an SMS arrives at TWILIO_NUMBER.
+    If the message body contains an email, create + share a calendar
+    named after the sender's phone number.
+    """
+    from_number = flask_request.form.get("From", "").strip()
+    body        = flask_request.form.get("Body", "").strip()
+
+    print(f"  [sms] Received from {from_number}: {body}")
+
+    phone = _normalise_number(from_number)
+
+    if body.strip().lower() == "delete":
+        print(f"  [sms] Delete request from {phone}")
+        threading.Thread(
+            target=delete_calendars_for_number,
+            args=(phone,),
+            daemon=True,
+        ).start()
+        return "", 204
+
+    email_match = EMAIL_RE.search(body)
+    if not email_match:
+        print("  [sms] No email found in message body, ignoring.")
+        return "", 204
+
+    email = email_match.group(0).lower()
+
+    print(f"  [sms] Onboarding {phone} -> {email}")
+
+    # Run in a background thread so the webhook responds immediately
+    threading.Thread(
+        target=create_and_share_calendar,
+        args=(phone, email),
+        daemon=True,
+    ).start()
+
+    return "", 204
+
+
+def start_ngrok_and_update_webhook() -> None:
+    """
+    Kill any existing ngrok tunnels, start a fresh one on FLASK_PORT,
+    then point the Twilio number's SMS webhook at it.
+    """
+    if NGROK_AUTH_TOKEN:
+        conf.get_default().auth_token = NGROK_AUTH_TOKEN
+
+    for tunnel in ngrok.get_tunnels():
+        ngrok.disconnect(tunnel.public_url)
+        print(f"  [ngrok] Killed existing tunnel: {tunnel.public_url}")
+
+    tunnel = ngrok.connect(FLASK_PORT, "http")
+    public_url = tunnel.public_url.replace("http://", "https://")
+    webhook_url = f"{public_url}/sms"
+    print(f"  [ngrok] Tunnel started: {webhook_url}")
+
+    numbers = twilio_client.incoming_phone_numbers.list(phone_number=TWILIO_NUMBER)
+    if numbers:
+        numbers[0].update(sms_url=webhook_url, sms_method="POST")
+        print(f"  [twilio] SMS webhook updated to: {webhook_url}")
+    else:
+        print(f"  [twilio] WARNING: could not find number {TWILIO_NUMBER} to update webhook.")
+
+
+def start_flask() -> None:
+    flask_app.run(host="0.0.0.0", port=FLASK_PORT, use_reloader=False)
+
+
 # ---------------------------------------------------------------------------
 # MAIN SCAN LOOP
 # ---------------------------------------------------------------------------
@@ -285,7 +468,17 @@ def scan(service) -> None:
 def main() -> None:
     print("Authenticating with Google Calendar...")
     service = _get_calendar_service()
-    print("Authenticated. Scanning every 60 seconds.\n")
+    print("Authenticated.")
+
+    # NEW: start ngrok + point Twilio's SMS webhook at it
+    print("Starting ngrok tunnel and updating Twilio webhook...")
+    start_ngrok_and_update_webhook()
+
+    # NEW: start the Flask SMS receiver in the background
+    print(f"Starting SMS listener on port {FLASK_PORT}...")
+    threading.Thread(target=start_flask, daemon=True).start()
+
+    print("Scanning every 60 seconds.\n")
 
     while True:
         try:
@@ -295,7 +488,4 @@ def main() -> None:
         time.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
-    # create_and_share_calendar("+16034792113", "cj.dev.code@gmail.com")
-    # create_and_share_calendar("+13479548056", "rebeccar221b@gmail.com")
-    # 1/0
     main()
