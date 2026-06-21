@@ -29,7 +29,7 @@ TWILIO_NUMBER  = os.environ.get("TWILIO_NUMBER", "")   # e.g. +16031234567
 MY_NUMBER      = os.environ.get("MY_NUMBER", "")       # Your personal number
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 NGROK_AUTH_TOKEN = os.environ.get("NGROK_AUTH_TOKEN", "")  # from ngrok.com dashboard
-FLASK_PORT     = int(os.environ.get("FLASK_PORT", 5001))
+FLASK_PORT     = int(os.environ.get("FLASK_PORT", 5000))
 
 CALENDAR_ID    = "cj.dev.code@gmail.com"                              # or a specific calendar ID
 CONTACTS_FILE  = Path("contacts.txt")
@@ -461,7 +461,11 @@ def scan(service) -> None:
 
         label = f"→ {contact_name}" if contact_name else ""
         print(f"[{now_str}] Matched: '{summary}' {label} ({target_number})")
-        initiate_bridge(event['host_number'], target_number)
+        threading.Thread(
+            target=initiate_bridge,
+            args=(event['host_number'], target_number),
+            daemon=True,
+        ).start()
         _fired[event_id] = start_time
 
 
